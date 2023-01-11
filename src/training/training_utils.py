@@ -2,6 +2,7 @@ from typing import Tuple, Dict, Callable, Any, List
 import torch
 import torch.nn.functional as F
 import numpy as np
+from tqdm.auto import tqdm
 
 #----------------------------------------------------------------------------
 
@@ -168,7 +169,7 @@ def generate_coords(batch_size: int, img_size: int, device='cpu', align_corners:
 
 #----------------------------------------------------------------------------
 
-def run_batchwise(fn: Callable, data: Dict[str, torch.Tensor], batch_size: int, dim: int=0, **kwargs) -> Any:
+def run_batchwise(fn: Callable, data: Dict[str, torch.Tensor], batch_size: int, dim: int=0, use_tqdm=False, **kwargs) -> Any:
     """
     Runs a function in a batchwise fashion along the `dim` dimension to prevent OOM
     Params:
@@ -188,7 +189,10 @@ def run_batchwise(fn: Callable, data: Dict[str, torch.Tensor], batch_size: int, 
     results = []
     num_runs = (values[0].shape[dim] + batch_size - 1) // batch_size
 
-    for i in range(num_runs):
+    gen = range(num_runs)
+    if use_tqdm:
+        gen = tqdm(gen)
+    for i in gen:
         assert dim == 1, f"Sorry, works only for dim=1, while provided dim={dim}"
         curr_data = {k: d[:, i * batch_size: (i+1) * batch_size] for k, d in data.items()}
         results.append(fn(**curr_data, **kwargs))
