@@ -20,17 +20,28 @@ from src.training.layers import (
 from src.training.rendering import (
     fancy_integration,
     get_initial_rays_trig,
+    get_initial_rays_orth,
     transform_points,
+    transform_points_orthogonal,
     sample_pdf,
     compute_cam2world_matrix,
     compute_bg_points,
+    to_homogeneous,
+    from_homogeneous,
 )
 from src.training.training_utils import linear_schedule, run_batchwise, extract_patches
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+
 
 @misc.profiled_function
-def tri_plane_renderer(x: torch.Tensor, coords: torch.Tensor, ray_d_world: torch.Tensor, mlp: Callable, scale: float=1.0) -> torch.Tensor:
+def tri_plane_renderer(
+    x: torch.Tensor,
+    coords: torch.Tensor,
+    ray_d_world: torch.Tensor,
+    mlp: Callable,
+    scale: float = 1.0,
+) -> torch.Tensor:
     """
     Computes RGB\sigma values from a tri-plane representation + MLP
 
@@ -318,7 +329,176 @@ class SynthesisNetwork(torch.nn.Module):
 
         return bg_int_out['rendered_feats'] # [batch_size, h * w, mlp_out_dim]
 
-    def forward(self, ws, camera_angles: torch.Tensor, patch_params: Dict=None, max_batch_res: int=128, return_depth: bool=False, ignore_bg: bool=False, bg_only: bool=False, fov=None, **block_kwargs):
+    def radiance(self, ws, points, ray_dir, camera_angles=None, max_batch_res=128):
+        """
+        Input:
+            points: [bz, n, 3]
+            ray_dir: [bz, n, 3]
+            transform: one of (None, 'perspective', 'orthogonal')
+        """
+        if self.cfg.backbone == "raw_planes":
+            plane_feats = (
+                self.tri_plane_decoder.repeat(len(ws), 1, 1, 1) + ws.sum() * 0.0
+            )  # [batch_size, 3, 256, 256]
+        else:
+            plane_feats = self.tri_plane_decoder(
+                ws[:, : self.tri_plane_decoder.num_ws]
+            )  # [batch_size, 3 * feat_dim, tp_h, tp_w]
+        num_steps = self.cfg.num_ray_steps
+
+        if camera_angles is not None:
+            c2w = compute_cam2world_matrix(
+                camera_angles, self.cfg.dataset.camera.radius
+            )  # [batch_size, 4, 4]
+            points = from_homogeneous(
+                torch.bmm(to_homogeneous(points), c2w.permute(0, 2, 1))
+            )
+            dir = torch.bmm(ray_dir, c2w[:, :3, :3].permute(0, 2, 1))
+
+        coarse_output = run_batchwise(
+            fn=tri_plane_renderer,
+            data=dict(coords=points),
+            batch_size=max_batch_res**2 * num_steps,
+            dim=1,
+            mlp=self.tri_plane_mlp,
+            x=plane_feats,
+            scale=self.cfg.dataset.cube_scale,
+            ray_d_world=ray_dir,
+        )  # [batch_size, h * w * num_steps, num_feats]
+
+        return coarse_output
+
+    def get_coarse_output(
+        self,
+        ws,
+        camera_angles: torch.Tensor,
+        patch_params: Dict = None,
+        max_batch_res: int = 128,
+        fov=None,
+        **block_kwargs,
+    ):
+        """
+        ws: [batch_size, num_ws, w_dim] --- latent codes
+        camera_angles: [batch_size, 3] --- yaw/pitch/roll angles (roll angles are never used)
+        patch_params: Dict {scales: [batch_size, 2], offsets: [batch_size, 2]} --- patch parameters (when we do patchwise training)
+        """
+        misc.assert_shape(camera_angles, [len(ws), 3])
+
+        if self.cfg.backbone == "raw_planes":
+            plane_feats = (
+                self.tri_plane_decoder.repeat(len(ws), 1, 1, 1) + ws.sum() * 0.0
+            )  # [batch_size, 3, 256, 256]
+        else:
+            plane_feats = self.tri_plane_decoder(
+                ws[:, : self.tri_plane_decoder.num_ws], **block_kwargs
+            )  # [batch_size, 3 * feat_dim, tp_h, tp_w]
+
+        camera_angles[:, [1]] = torch.clamp(
+            camera_angles[:, [1]], 1e-5, np.pi - 1e-5
+        )  # [batch_size, 1]
+        batch_size = ws.shape[0]
+        h = w = self.train_resolution if self.training else self.test_resolution
+        fov = self.cfg.dataset.camera.fov if fov is None else fov  # [1] or [batch_size]
+
+        if self.cfg.bg_model.type == "plane":
+            bg = plane_feats[:, -self.img_channels :, :, :]  # [batch_size, h, w]
+            bg = F.interpolate(
+                bg,
+                size=(self.img_resolution, self.img_resolution),
+                mode="bilinear",
+                align_corners=True,
+            )  # [batch_size, c, h, w]
+            plane_feats = plane_feats[
+                :, : -self.img_channels, :, :
+            ].contiguous()  # [batch_size, c, h, w]
+
+            if not patch_params is None:
+                bg = extract_patches(
+                    bg, patch_params, resolution=self.cfg.patch.resolution
+                )  # [batch_size, c, h_patch, w_patch]
+            bg = bg.view(batch_size, self.img_channels, h * w).permute(
+                0, 2, 1
+            )  # # [batch_size, h * w, c]
+
+        num_steps = self.cfg.num_ray_steps
+        tri_plane_out_dim = self.img_channels + 1
+
+        # <==================
+        # Point sampling start
+        c2w = compute_cam2world_matrix(
+            camera_angles, self.cfg.dataset.camera.radius
+        )  # [batch_size, 4, 4]
+
+        # points_world [bz, h*w, num_steps, 3]
+        # z_vals [bz, h*w, num_steps, 1]
+        # ray_d_world [bz, h*w, 3]
+        # ray_o_world [bz, h*w, 3]
+        if not self.cfg.get("render_orthogonal", False):
+            z_vals, rays_d_cam = get_initial_rays_trig(
+                batch_size,
+                num_steps,
+                resolution=(h, w),
+                device=ws.device,
+                ray_start=self.cfg.dataset.camera.ray_start,
+                ray_end=self.cfg.dataset.camera.ray_end,
+                fov=fov,
+                patch_params=patch_params,
+            )
+            points_world, z_vals, ray_d_world, ray_o_world = transform_points(
+                z_vals=z_vals, ray_directions=rays_d_cam, c2w=c2w
+            )  # [batch_size, h * w, num_steps, 1], [?]
+        else:
+            z_vals, origins, direction = get_initial_rays_orth(
+                batch_size,
+                num_steps,
+                resolution=(h, w),
+                device=ws.device,
+                ray_start=self.cfg.dataset.camera.ray_start,
+                ray_end=self.cfg.dataset.camera.ray_end,
+                fov=fov,
+            )
+            (
+                points_world,
+                z_vals,
+                ray_d_world,
+                ray_o_world,
+            ) = transform_points_orthogonal(z_vals, origins, direction, c2w)
+
+        points_world = points_world.reshape(
+            batch_size, h * w * num_steps, 3
+        )  # [batch_size, h * w * num_steps, 3]
+
+        # Point sampling end
+        # <==================
+
+        coarse_output = run_batchwise(
+            fn=tri_plane_renderer,
+            data=dict(coords=points_world),
+            batch_size=max_batch_res**2 * num_steps,
+            dim=1,
+            mlp=self.tri_plane_mlp,
+            x=plane_feats,
+            scale=self.cfg.dataset.cube_scale,
+            ray_d_world=ray_d_world,
+        )  # [batch_size, h * w * num_steps, num_feats]
+        coarse_output = coarse_output.view(
+            batch_size, h * w, num_steps, tri_plane_out_dim
+        )  # [batch_size, h * w, num_steps, num_feats]
+
+        return coarse_output, z_vals, origins
+
+    def forward(
+        self,
+        ws,
+        camera_angles: torch.Tensor,
+        patch_params: Dict = None,
+        max_batch_res: int = 128,
+        return_depth: bool = False,
+        ignore_bg: bool = False,
+        bg_only: bool = False,
+        fov=None,
+        **block_kwargs,
+    ):
         """
         ws: [batch_size, num_ws, w_dim] --- latent codes
         camera_angles: [batch_size, 3] --- yaw/pitch/roll angles (roll angles are never used)
@@ -351,12 +531,53 @@ class SynthesisNetwork(torch.nn.Module):
         white_back_end_idx = self.img_channels if self.cfg.dataset.white_back else 0
         nerf_noise_std = self.nerf_noise_std if self.training else 0.0
 
-        z_vals, rays_d_cam = get_initial_rays_trig(
-            batch_size, num_steps, resolution=(h, w), device=ws.device, ray_start=self.cfg.dataset.camera.ray_start,
-            ray_end=self.cfg.dataset.camera.ray_end, fov=fov, patch_params=patch_params)
-        c2w = compute_cam2world_matrix(camera_angles, self.cfg.dataset.camera.radius) # [batch_size, 4, 4]
-        points_world, z_vals, ray_d_world, ray_o_world = transform_points(z_vals=z_vals, ray_directions=rays_d_cam, c2w=c2w) # [batch_size, h * w, num_steps, 1], [?]
-        points_world = points_world.reshape(batch_size, h * w * num_steps, 3) # [batch_size, h * w * num_steps, 3]
+        # <==================
+        # Point sampling start
+        c2w = compute_cam2world_matrix(
+            camera_angles, self.cfg.dataset.camera.radius
+        )  # [batch_size, 4, 4]
+
+        # points_world [bz, h*w, num_steps, 3]
+        # z_vals [bz, h*w, num_steps, 1]
+        # ray_d_world [bz, h*w, 3]
+        # ray_o_world [bz, h*w, 3]
+        if not self.cfg.get("render_orthogonal", False):
+            z_vals, rays_d_cam = get_initial_rays_trig(
+                batch_size,
+                num_steps,
+                resolution=(h, w),
+                device=ws.device,
+                ray_start=self.cfg.dataset.camera.ray_start,
+                ray_end=self.cfg.dataset.camera.ray_end,
+                fov=fov,
+                patch_params=patch_params,
+            )
+            points_world, z_vals, ray_d_world, ray_o_world = transform_points(
+                z_vals=z_vals, ray_directions=rays_d_cam, c2w=c2w
+            )  # [batch_size, h * w, num_steps, 1], [?]
+        else:
+            z_vals, origins, direction = get_initial_rays_orth(
+                batch_size,
+                num_steps,
+                resolution=(h, w),
+                device=ws.device,
+                ray_start=self.cfg.dataset.camera.ray_start,
+                ray_end=self.cfg.dataset.camera.ray_end,
+                fov=fov,
+            )
+            (
+                points_world,
+                z_vals,
+                ray_d_world,
+                ray_o_world,
+            ) = transform_points_orthogonal(z_vals, origins, direction, c2w)
+
+        points_world = points_world.reshape(
+            batch_size, h * w * num_steps, 3
+        )  # [batch_size, h * w * num_steps, 3]
+
+        # Point sampling end
+        # <==================
 
         coarse_output = run_batchwise(
             fn=tri_plane_renderer, data=dict(coords=points_world),

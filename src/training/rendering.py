@@ -33,6 +33,22 @@ def normalize(x: torch.Tensor, dim: int=-1) -> torch.Tensor:
     return x / (torch.norm(x, dim=dim, keepdim=True))
 
 #----------------------------------------------------------------------------
+def to_homogeneous(points):
+    """
+    Args:
+        points: (*, D)
+
+    Returns:
+        points: (*, D+1)
+    """
+    return torch.cat(
+        (points, torch.ones((*points.shape[:-1], 1), device=points.device)), dim=-1
+    )
+
+
+def from_homogeneous(points):
+    return points[..., :-1]
+#----------------------------------------------------------------------------
 
 @misc.profiled_function
 def fancy_integration(rgb_sigma, z_vals, noise_std=0.5, last_back=False, white_back_end_idx: int=0, clamp_mode=None, fill_mode=None, sp_beta: float=1.0, use_inf_depth: bool=True):
@@ -142,6 +158,33 @@ def get_initial_rays_trig(batch_size: int, num_steps: int, device, fov: float, r
 
     return z_vals, rays_d_cam
 
+def get_initial_rays_orth(batch_size, num_steps, device, fov, resolution, ray_start, ray_end):
+    """
+    Returns:
+        z_vals: [bz, h*w, num_steps]
+        origins: [bz, h*w, 3]
+        direction: [bz, 3]
+    """
+    w, h = resolution
+
+    fov = torch.tensor(fov)
+
+    # Range for x,y such that all of the space that would be covered using perspective sampling
+    # will be occupied with these orthogonal samples 
+    xy_limiter = ray_end * torch.tan(torch.deg2rad(fov) * 0.5)
+
+    x, y = torch.meshgrid(
+        torch.linspace(-xy_limiter, xy_limiter, w, device=device), 
+        torch.linspace(xy_limiter, -xy_limiter, h, device=device), 
+        indexing='ij'
+    )
+    x = x.T.flatten().unsqueeze(0).repeat(batch_size, 1) # [compute_batch_size, h * w]
+    y = y.T.flatten().unsqueeze(0).repeat(batch_size, 1) # [compute_batch_size, h * w]
+    z_vals = torch.linspace(ray_start, ray_end, num_steps, device=device)[None, None].expand(batch_size, h*w, -1)
+    origins = torch.stack((x, y, torch.zeros_like(x)), -1)
+    direction = torch.tensor([0, 0, -1], device=device, dtype=torch.float32)[None].expand(batch_size, -1)
+
+    return z_vals, origins, direction
 #----------------------------------------------------------------------------
 
 def perturb_points(z_vals):
@@ -177,6 +220,41 @@ def transform_points(z_vals, ray_directions, c2w: torch.Tensor, perturb: bool=Tr
     ray_o_world = torch.bmm(c2w, homogeneous_origins).permute(0, 2, 1).reshape(batch_size, num_rays, 4)[..., :3]
 
     return points_world[..., :3], z_vals, ray_d_world, ray_o_world
+
+def transform_points_orthogonal(z_vals, origins, direction, c2w, perturb: bool=True):
+    """
+    Given main parameters for orthogonal camera setup, sample grid points
+
+    Input:
+        z_vals: [bz, h*w, num_steps]
+        origins: [bz, h*w, 3]
+        direction: [bz, 3]
+        c2w: [bz, 4, 4]
+
+    Output:
+        points_world: [bz, h*w, num_steps, 3]
+        z_vals: [bz, h*w, num_steps, 1]
+        ray_d_world: [bz, h*w, 3]
+        ray_o_world: [bz, h*w, 3]
+    """
+    bz = z_vals.shape[0]
+    z_vals = z_vals[..., None]
+    if perturb:
+        z_vals = perturb_points(z_vals)
+    
+    points_cam = origins[:, :, None] + z_vals * direction[:, None, None] # [bz, h*w, num_steps, 3]
+
+    points_world = from_homogeneous(torch.bmm(
+        c2w, 
+        to_homogeneous(points_cam).reshape(bz, -1, 4).permute(0, 2, 1)
+    ).permute(0, 2, 1)).reshape(points_cam.shape)
+    ray_d_world = torch.bmm(c2w[:, :3, :3], direction.reshape(bz, 3, 1))[:, None, :, 0].expand(-1, origins.shape[1], -1)
+    ray_o_world = from_homogeneous(torch.bmm(
+        c2w, 
+        to_homogeneous(origins).permute(0, 2, 1)
+    ).permute(0, 2, 1)).reshape(origins.shape)
+
+    return points_world, z_vals, ray_d_world, ray_o_world
 
 #----------------------------------------------------------------------------
 
