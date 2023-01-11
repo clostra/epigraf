@@ -117,7 +117,8 @@ def generate_trajectory(cfg, G, ws: torch.Tensor, trajectory: List, fovs: torch.
 def generate(cfg: DictConfig, G, ws: torch.Tensor, angles: torch.Tensor, fovs: torch.Tensor=None, verbose: bool=True, **synthesis_kwargs):
     assert len(ws) == len(angles), f"Wrong shapes: {ws.shape} vs {angles.shape}"
     max_batch_res_kwargs = {} if cfg.max_batch_res is None else dict(max_batch_res=cfg.max_batch_res)
-    synthesis_kwargs = dict(return_depth=False, noise_mode='const', **max_batch_res_kwargs, **synthesis_kwargs)
+    return_depth = synthesis_kwargs.pop("return_depth", False)
+    synthesis_kwargs = dict(return_depth=return_depth, noise_mode='const', **max_batch_res_kwargs, **synthesis_kwargs)
     frames = []
     batch_indices = range(0, (len(ws) + cfg.batch_size - 1) // cfg.batch_size)
     batch_indices = tqdm(batch_indices, desc='Generating') if verbose else batch_indices
