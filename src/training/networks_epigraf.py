@@ -280,7 +280,7 @@ class SynthesisNetwork(torch.nn.Module):
         """
         assert not use_bg, f"Background NeRF is not supported."
         if self.cfg.backbone == 'raw_planes':
-            plane_feats = self.tri_plane_decoder.repeat(len(ws), 1, 1, 1) + ws.sum() * 0.0 # [batch_size, 3, 256, 256]
+            plane_feats = self.tri_plane_decoder.repeat(len(ws), 1, 1, 1) # [batch_size, 3, 256, 256]
         else:
             plane_feats = self.tri_plane_decoder(ws[:, :self.tri_plane_decoder.num_ws], **block_kwargs) # [batch_size, 3 * feat_dim, tp_h, tp_w]
         ray_d_world = torch.zeros_like(coords) # [batch_size, num_points, 3]
@@ -338,7 +338,7 @@ class SynthesisNetwork(torch.nn.Module):
         """
         if self.cfg.backbone == "raw_planes":
             plane_feats = (
-                self.tri_plane_decoder.repeat(len(ws), 1, 1, 1) + ws.sum() * 0.0
+                self.tri_plane_decoder.repeat(len(ws), 1, 1, 1)
             )  # [batch_size, 3, 256, 256]
         else:
             plane_feats = self.tri_plane_decoder(
@@ -386,7 +386,7 @@ class SynthesisNetwork(torch.nn.Module):
 
         if self.cfg.backbone == "raw_planes":
             plane_feats = (
-                self.tri_plane_decoder.repeat(len(ws), 1, 1, 1) + ws.sum() * 0.0
+                self.tri_plane_decoder.repeat(len(ws), 1, 1, 1)
             )  # [batch_size, 3, 256, 256]
         else:
             plane_feats = self.tri_plane_decoder(
@@ -507,7 +507,7 @@ class SynthesisNetwork(torch.nn.Module):
         misc.assert_shape(camera_angles, [len(ws), 3])
 
         if self.cfg.backbone == 'raw_planes':
-            plane_feats = self.tri_plane_decoder.repeat(len(ws), 1, 1, 1) + ws.sum() * 0.0 # [batch_size, 3, 256, 256]
+            plane_feats = self.tri_plane_decoder.repeat(len(ws), 1, 1, 1) # [batch_size, 3, 256, 256]
         else:
             plane_feats = self.tri_plane_decoder(ws[:, :self.tri_plane_decoder.num_ws], **block_kwargs) # [batch_size, 3 * feat_dim, tp_h, tp_w]
 
